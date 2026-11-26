@@ -899,7 +899,7 @@ internal class AndroidQueueCoordinator(
                             if (continuation != null) {
                                 GlobalYouTubeRepository.instance.continueRadioQueue(continuation)
                             } else {
-                                GlobalYouTubeRepository.instance.startRadioQueue(seedId)
+                                startCurrentRadioPage(seedId)
                             }
                         }
                     }
@@ -1139,7 +1139,7 @@ internal class AndroidQueueCoordinator(
                 withQueueLoading {
                     withContext(Dispatchers.IO) {
                         if (nextContinuation == null) {
-                            GlobalYouTubeRepository.instance.startRadioQueue(seedId)
+                            startCurrentRadioPage(seedId)
                         } else {
                             GlobalYouTubeRepository.instance.continueRadioQueue(nextContinuation)
                         }

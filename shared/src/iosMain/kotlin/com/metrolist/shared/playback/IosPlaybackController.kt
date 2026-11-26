@@ -1524,7 +1524,7 @@ internal class IosPlaybackController(
                 try {
                     val page =
                         loadRadioRecommendations(
-                            if (requestPlaylistId == null && !explicitFeed) {
+                            if (!explicitFeed) {
                                 repository().startRadioQueue(seedSongId, classic = requestClassic)
                             } else {
                                 repository().startRadioQueue(

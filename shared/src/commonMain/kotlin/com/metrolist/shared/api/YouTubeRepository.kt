@@ -6,12 +6,15 @@ import com.metrolist.innertubex.bodyAsTextLimited
 import com.metrolist.innertubex.extraction.ContentHints
 import com.metrolist.innertubex.extraction.PlaybackTrackingData
 import com.metrolist.innertubex.models.AccountInfo
+import com.metrolist.innertubex.models.Context
 import com.metrolist.innertubex.models.YouTubeClient
 import com.metrolist.innertubex.models.YouTubeDataPage
+import com.metrolist.innertubex.models.YouTubeLocale
 import com.metrolist.innertubex.models.response.AccountsListResponse
 import com.metrolist.innertubex.models.response.BrowseResponse
 import com.metrolist.innertubex.models.response.GetQueueResponse
 import com.metrolist.innertubex.models.response.PlayerResponse
+import com.metrolist.innertubex.utils.sha1
 import com.metrolist.shared.api.YouTubeRadioParser.parsePlaylistPanelItem
 import com.metrolist.shared.api.YouTubeRadioParser.parseRadioQueueResponse
 import com.metrolist.shared.api.YouTubeRadioParser.parseRadioResponse
@@ -98,11 +101,22 @@ import com.metrolist.shared.youtube.playback.PlaybackEventKind
 import com.metrolist.shared.youtube.playback.PlaybackEventLog
 import com.metrolist.shared.youtube.playback.PlaybackNetworkStateStore
 import com.metrolist.shared.youtube.playback.StreamResolver
+import io.ktor.client.plugins.HttpRequestTimeoutException
 import io.ktor.client.plugins.ResponseException
+import io.ktor.client.plugins.expectSuccess
 import io.ktor.client.request.get
+import io.ktor.client.request.headers
+import io.ktor.client.request.parameter
+import io.ktor.client.request.preparePost
+import io.ktor.client.request.setBody
 import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsChannel
+import io.ktor.http.ContentType
+import io.ktor.http.HttpHeaders
+import io.ktor.http.content.TextContent
+import io.ktor.http.contentType
 import io.ktor.http.isSuccess
+import io.ktor.http.userAgent
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.cancel
 import kotlinx.atomicfu.locks.SynchronizedObject
@@ -123,7 +137,10 @@ import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.io.IOException
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -135,6 +152,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.jetbrains.compose.resources.getString
 import kotlin.time.Clock
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 internal const val SMALL_RESPONSE_LIMIT = 2 * 1024 * 1024
@@ -2508,6 +2526,7 @@ class YouTubeRepository(
         val playlistId: String?,
         val params: String?,
         val continuation: String?,
+        val includeAudioWatchConfig: Boolean = false,
     )
 
     private val nextRequestsLock = SynchronizedObject()
@@ -2518,10 +2537,11 @@ class YouTubeRepository(
         playlistId: String? = null,
         params: String? = null,
         continuation: String? = null,
+        includeAudioWatchConfig: Boolean = false,
         session: InnerTube.SessionSnapshot = innerTube.sessionSnapshot(),
     ): JsonObject {
         val voteRevision = SongLikeState.voteObservationRevision()
-        val key = NextRequestKey(session, videoId, playlistId, params, continuation)
+        val key = NextRequestKey(session, videoId, playlistId, params, continuation, includeAudioWatchConfig)
         while (true) {
             val request = CompletableDeferred<JsonObject>()
             val pending = synchronized(nextRequestsLock) { nextRequests.getOrPut(key) { request } }
@@ -2536,20 +2556,17 @@ class YouTubeRepository(
                 }
             }
             try {
-                requireCurrentSession(session)
-                val response =
-                    innerTube.next(
-                        YouTubeClient.WEB_REMIX,
-                        videoId,
-                        playlistId,
+                val body =
+                    postYouTubeMusicNext(
+                        session = session,
+                        videoId = videoId,
+                        playlistId = playlistId,
                         params = params,
                         continuation = continuation,
+                        includeAudioWatchConfig = includeAudioWatchConfig,
                     )
-                if (!response.status.isSuccess()) YtLogger.w(TAG, "Song next status=${response.status.value}")
-                check(response.status.isSuccess()) { "Next request failed with HTTP ${response.status.value}" }
-                val body = response.bodyLimited<JsonObject>(PLAYER_NEXT_RESPONSE_LIMIT)
                 requireCurrentSession(session)
-                if (session.useLoginForBrowse && innerTube.hasSapCookieAuth(session)) {
+                if (innerTube.hasSapCookieAuth(session)) {
                     reconcileSongVotes(body, voteRevision)
                 }
                 return body.also(request::complete)
@@ -2562,23 +2579,150 @@ class YouTubeRepository(
         }
     }
 
-    suspend fun startRadio(videoId: String): List<SongItem> =
-        startRadioQueue(videoId, playlistId = if (Settings.shared.classicRecommendations) null else "RDAMVM$videoId").songs
+    private suspend fun postYouTubeMusicNext(
+        session: InnerTube.SessionSnapshot,
+        videoId: String?,
+        playlistId: String?,
+        params: String?,
+        continuation: String?,
+        includeAudioWatchConfig: Boolean,
+    ): JsonObject {
+        val client = YouTubeClient.WEB_REMIX
+        val hasAccountCookie = !session.cookie.isNullOrBlank()
+        val payload =
+            nextRequestJson.encodeToString(
+                YouTubeMusicNextBody(
+                    context =
+                        client.toContext(
+                            session.locale,
+                            session.visitorData,
+                            session.dataSyncId?.takeIf { hasAccountCookie && it.isNotBlank() },
+                        ),
+                    videoId = videoId,
+                    playlistId = playlistId,
+                    params = params,
+                    continuation = continuation,
+                    watchEndpointMusicSupportedConfigs =
+                        if (includeAudioWatchConfig && videoId != null && params == null) {
+                            MusicWatchEndpointSupportedConfigs()
+                        } else {
+                            null
+                        },
+                ),
+            )
+        var currentDelayMs = INITIAL_NEXT_RETRY_DELAY_MS
+        var attempt = 0
+        while (true) {
+            currentCoroutineContext().ensureActive()
+            requireCurrentSession(session)
+            try {
+                val result =
+                    innerTube.httpClient
+                        .preparePost(YOUTUBE_MUSIC_NEXT_URL) {
+                            expectSuccess = false
+                            parameter("prettyPrint", false)
+                            userAgent(client.userAgent)
+                            contentType(ContentType.Application.Json)
+                            headers {
+                                append("X-Goog-Api-Format-Version", "1")
+                                append("X-YouTube-Client-Name", client.clientId)
+                                append("X-YouTube-Client-Version", client.clientVersion)
+                                append("Origin", YOUTUBE_MUSIC_ORIGIN)
+                                append("X-Origin", YOUTUBE_MUSIC_ORIGIN)
+                                append("Referer", YOUTUBE_MUSIC_REFERER)
+                                session.locale.nextAcceptLanguageHeader().takeIf { it.isNotBlank() }?.let {
+                                    append(HttpHeaders.AcceptLanguage, it)
+                                }
+                                session.visitorData?.takeIf { it.isNotBlank() }?.let {
+                                    append("X-Goog-Visitor-Id", it)
+                                }
+                                injectNextPrefCookie(session.cookie, session.locale.hl, session.locale.gl)?.let {
+                                    append(HttpHeaders.Cookie, it)
+                                }
+                                if (hasAccountCookie) {
+                                    append("X-Goog-AuthUser", session.authUser)
+                                    buildSapisidAuthHeader(
+                                        YOUTUBE_MUSIC_ORIGIN,
+                                        session.sapisid,
+                                        nowMs() / 1000L,
+                                    )?.let { append(HttpHeaders.Authorization, it) }
+                                }
+                            }
+                            setBody(TextContent(payload, ContentType.Application.Json))
+                        }.execute { response ->
+                            val statusCode = response.status.value
+                            val retryAfterMs =
+                                if (statusCode == 429) {
+                                    response.headers[HttpHeaders.RetryAfter]
+                                        ?.toLongOrNull()
+                                        ?.times(1_000L)
+                                        ?.takeIf { it in 0..MAX_NEXT_RETRY_AFTER_MS }
+                                } else {
+                                    null
+                                }
+                            val retryableStatus =
+                                statusCode in TRANSIENT_NEXT_STATUS_CODES &&
+                                    (statusCode != 429 || retryAfterMs != null)
+                            if (retryableStatus && attempt + 1 < MAX_NEXT_ATTEMPTS) {
+                                response.bodyAsChannel().cancel(null)
+                                return@execute NextAttemptResult.Retry(retryAfterMs ?: currentDelayMs)
+                            }
+                            if (!response.status.isSuccess()) {
+                                YtLogger.w(TAG, "Song next status=$statusCode")
+                                response.bodyAsChannel().cancel(null)
+                                error("Next request failed with HTTP $statusCode")
+                            }
+                            val parsed = response.bodyLimited<JsonObject>(PLAYER_NEXT_RESPONSE_LIMIT)
+                            NextAttemptResult.Success(parsed)
+                        }
+                when (result) {
+                    is NextAttemptResult.Success -> return result.body
+
+                    is NextAttemptResult.Retry -> {
+                        attempt++
+                        delay(result.delayMs.milliseconds)
+                        currentDelayMs *= 2
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                attempt++
+                val retryableError = error is IOException || error is HttpRequestTimeoutException
+                if (!retryableError || attempt >= MAX_NEXT_ATTEMPTS) {
+                    throw error
+                }
+                delay(currentDelayMs.milliseconds)
+                currentDelayMs *= 2
+            }
+        }
+    }
+
+    suspend fun startRadio(videoId: String): List<SongItem> = startRadioQueue(videoId).songs
 
     suspend fun startRadioQueue(
         videoId: String,
         classic: Boolean = Settings.shared.classicRecommendations,
     ): RadioQueuePage {
         val mixPlaylistId = "RDAMVM$videoId"
-        if (!classic) return startRadioQueue(videoId, playlistId = mixPlaylistId)
+        if (!classic) return startRadioQueue(videoId, playlistId = mixPlaylistId, params = RADIO_MIX_PARAMS)
 
         val session = innerTube.sessionSnapshot()
-        val firstPage = parseRadioQueueResponse(nextResponse(videoId, session = session))
+        val firstResponse = nextResponse(videoId, includeAudioWatchConfig = true, session = session)
+        val firstPage = parseRadioQueueResponse(firstResponse)
         val page =
             if (firstPage.continuation == null && firstPage.songs.isNotEmpty() && firstPage.songs.all { it.id == videoId }) {
                 currentCoroutineContext().ensureActive()
                 try {
-                    val fallback = parseRadioQueueResponse(nextResponse(videoId, playlistId = mixPlaylistId, session = session))
+                    val fallback =
+                        parseRadioQueueResponse(
+                            nextResponse(
+                                videoId,
+                                playlistId = mixPlaylistId,
+                                params = RADIO_MIX_PARAMS,
+                                session = session,
+                            ),
+                        )
                     when {
                         fallback.continuation == null && fallback.songs.none { it.id != videoId } -> firstPage
 
@@ -2920,4 +3064,108 @@ internal fun JsonObject.isYouTubeLoggedOut(): Boolean {
                 }
         } == true
     }
+}
+
+private const val YOUTUBE_MUSIC_ORIGIN = "https://music.youtube.com"
+private const val YOUTUBE_MUSIC_REFERER = "$YOUTUBE_MUSIC_ORIGIN/"
+private const val YOUTUBE_MUSIC_NEXT_URL = "$YOUTUBE_MUSIC_ORIGIN/youtubei/v1/next"
+private const val RADIO_MIX_PARAMS = "wAEB"
+private const val AUTOMIX_SETTING_NORMAL = "AUTOMIX_SETTING_NORMAL"
+private const val MUSIC_VIDEO_TYPE_ATV = "MUSIC_VIDEO_TYPE_ATV"
+private const val MAX_NEXT_ATTEMPTS = 3
+private const val INITIAL_NEXT_RETRY_DELAY_MS = 500L
+private const val MAX_NEXT_RETRY_AFTER_MS = 5_000L
+private val TRANSIENT_NEXT_STATUS_CODES = setOf(408, 425, 429, 500, 502, 503, 504)
+
+private val nextRequestJson =
+    Json {
+        encodeDefaults = true
+        explicitNulls = false
+    }
+
+@Serializable
+private data class MusicWatchEndpointConfig(
+    val hasPersistentPlaylistPanel: Boolean = true,
+    val musicVideoType: String = MUSIC_VIDEO_TYPE_ATV,
+)
+
+@Serializable
+private data class MusicWatchEndpointSupportedConfigs(
+    val watchEndpointMusicConfig: MusicWatchEndpointConfig = MusicWatchEndpointConfig(),
+)
+
+@Serializable
+private data class YouTubeMusicNextBody(
+    val context: Context,
+    val videoId: String? = null,
+    val playlistId: String? = null,
+    val params: String? = null,
+    val continuation: String? = null,
+    val isAudioOnly: Boolean = true,
+    val enablePersistentPlaylistPanel: Boolean = true,
+    val tunerSettingValue: String = AUTOMIX_SETTING_NORMAL,
+    val contentCheckOk: Boolean = true,
+    val racyCheckOk: Boolean = true,
+    val watchEndpointMusicSupportedConfigs: MusicWatchEndpointSupportedConfigs? = null,
+)
+
+private sealed interface NextAttemptResult {
+    data class Success(
+        val body: JsonObject,
+    ) : NextAttemptResult
+
+    data class Retry(
+        val delayMs: Long,
+    ) : NextAttemptResult
+}
+
+private fun YouTubeLocale.nextAcceptLanguageHeader(): String {
+    val languageTag = hl.replace('_', '-')
+    if (languageTag.isBlank()) return ""
+    val regionalTag = if ('-' in languageTag || gl.isEmpty()) languageTag else "$languageTag-$gl"
+    val fallback = languageTag.substringBefore('-')
+    return if (regionalTag == fallback) regionalTag else "$regionalTag,$fallback;q=0.9"
+}
+
+private fun injectNextPrefCookie(
+    cookie: String?,
+    hl: String,
+    gl: String,
+): String? {
+    val prefParts = mutableListOf<String>()
+    val otherParts = mutableListOf<String>()
+    cookie
+        .orEmpty()
+        .split(';')
+        .map(String::trim)
+        .filter(String::isNotEmpty)
+        .forEach { part ->
+            if (part.startsWith("PREF=", ignoreCase = true)) {
+                part
+                    .substringAfter('=')
+                    .split('&')
+                    .filterTo(prefParts) { it.isNotEmpty() && !it.startsWith("hl=") && !it.startsWith("gl=") }
+            } else {
+                otherParts += part
+            }
+        }
+    if (gl.isNotBlank()) prefParts.add(0, "gl=$gl")
+    if (hl.isNotBlank()) prefParts.add(0, "hl=$hl")
+    val entries =
+        if (prefParts.isNotEmpty()) {
+            otherParts + "PREF=${prefParts.joinToString("&")}"
+        } else {
+            otherParts
+        }
+    return entries.takeIf { it.isNotEmpty() }?.joinToString("; ")
+}
+
+private fun buildSapisidAuthHeader(
+    origin: String,
+    sapisid: String?,
+    nowSeconds: Long,
+): String? {
+    val value = sapisid?.takeIf { it.isNotBlank() } ?: return null
+    val hash = sha1("$nowSeconds $value $origin")
+    return "SAPISIDHASH ${nowSeconds}_$hash"
 }
