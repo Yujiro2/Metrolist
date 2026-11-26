@@ -78,7 +78,7 @@ on:
 jobs:
   build:
     name: APK
-    runs-on: blacksmith-8vcpu-ubuntu-2604
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Check out repository
@@ -219,7 +219,7 @@ jobs:
           fi
           # gradle.properties caps local builds at 4 workers and 4 GiB; the CI runner has 8 vCPUs.
           ./gradlew "${tasks[@]}" --no-daemon --max-workers="$(nproc)" \
-            "-Dorg.gradle.jvmargs=-Xmx8g -XX:MaxMetaspaceSize=1g -XX:+UseParallelGC -Dfile.encoding=UTF-8" \
+            "-Dorg.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=1g -XX:+UseParallelGC -Dfile.encoding=UTF-8" \
             "${extra_args[@]}"
 
       - name: Upload lint report
